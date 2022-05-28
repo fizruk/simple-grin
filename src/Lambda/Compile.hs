@@ -12,10 +12,10 @@ import           Syntax.Lambda.Abs
 import qualified Syntax.GRIN.Print    as GRIN
 import qualified Syntax.Lambda.Par    as Lambda
 
-newtype CodeGen a = CodeGen { runCodeGen :: ReaderT [Var] (State [GRIN.Var]) a }
+newtype CodeGen a = CodeGen { runCodeGen :: ReaderT [(Var, Int)] (State [GRIN.Var]) a }
   deriving (Functor, Applicative, Monad)
 
-knownFunctions :: CodeGen [Var]
+knownFunctions :: CodeGen [(Var, Int)]
 knownFunctions = CodeGen ask
 
 freshVar :: CodeGen GRIN.Var
@@ -36,8 +36,42 @@ varToLPat = GRIN.LPat . GRIN.SimpleVal . GRIN.SimpleVar . coerce
 mkFunTag :: Var -> GRIN.Tag
 mkFunTag = coerce . ("F" <>) . coerce
 
+mkPartialFunTag :: Var -> Int -> GRIN.Tag
+mkPartialFunTag f leftover = coerce ("P" <> coerce f <> "_" <> show leftover)
+
 mkConTag :: Con -> GRIN.Tag
 mkConTag = coerce . ("C" <>) . coerce
+
+withAtomAsSimpleVal :: Atom -> (GRIN.SimpleVal -> CodeGen GRIN.Exp) -> CodeGen GRIN.Exp
+withAtomAsSimpleVal (AtomVar x) mk = do
+  fs <- knownFunctions
+  case lookup x fs of
+    Nothing -> mk (GRIN.SimpleVar (coerce x))
+    Just{}  -> do
+      v <- freshVar
+      let vpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar v))
+      e1 <- compileExpNonStrict (App x [])
+      e2 <- mk (GRIN.SimpleVar v)
+      return $ mkGRINSequencing e1 vpat e2
+withAtomAsSimpleVal (AtomLiteral l) mk = mk (GRIN.SimpleLiteral (compileLiteral l))
+
+withAtomsAsSimpleVals :: [Atom] -> ([GRIN.SimpleVal] -> CodeGen GRIN.Exp) -> CodeGen GRIN.Exp
+withAtomsAsSimpleVals atoms mk = go [] atoms
+  where
+    go vals [] = mk vals
+    go vals (a:as) =
+      case a of
+        AtomVar x -> do
+          fs <- knownFunctions
+          case lookup x fs of
+            Nothing -> go (vals ++ [atomToSimpleVal a]) as
+            Just{}  -> do
+              v <- freshVar
+              let vpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar v))
+              e1 <- compileExpNonStrict (App x [])
+              e2 <- go (vals ++ [GRIN.SimpleVar v]) as
+              return $ mkGRINSequencing e1 vpat e2
+        AtomLiteral{} -> go (vals ++ [atomToSimpleVal a]) as
 
 atomToSimpleVal :: Atom -> GRIN.SimpleVal
 atomToSimpleVal (AtomVar x)     = GRIN.SimpleVar (coerce x)
@@ -54,20 +88,33 @@ mkGRINSequencing e1 x e2 =
 
 compileExpNonStrict :: Exp -> CodeGen GRIN.Exp
 compileExpNonStrict = \case
+  e@(Atom (AtomVar x)) -> do
+    fs <- knownFunctions
+    case lookup x fs of
+      Nothing -> compileReturn e
+      Just _  -> compileExpNonStrict (App x [])
   App f args -> do
     fs <- knownFunctions
-    if f `elem` fs
-       then return $ GRIN.Store (GRIN.ConstantTag (mkFunTag f) (atomToSimpleVal <$> args))
-       else error ("unknown function: " <> show f) -- need to apply HOF techniques
+    case lookup f fs of
+      Nothing -> do
+        v <- freshVar
+        let vpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar v))
+        withAtomsAsSimpleVals args $ \args' -> return $
+          mkGRINSequencing (GRIN.App (coerce "eval") [atomToSimpleVal (AtomVar f)]) vpat $
+            GRIN.App (coerce ("apply_" <> show (length args))) (GRIN.SimpleVar v : args')
+      Just n
+        | n == length args -> withAtomsAsSimpleVals args $ \args' -> return $
+            GRIN.Store (GRIN.ConstantTag (mkFunTag f) args')
+        | otherwise -> withAtomsAsSimpleVals args $ \args' -> return $
+            GRIN.Store (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) args')
   e -> compileReturn e
 
 compileReturn :: Exp -> CodeGen GRIN.Exp
 compileReturn = \case
-  Let _x e1 e2 -> do -- FIXME: do not ignore x
+  Let x e1 e2 -> do -- FIXME: do not ignore x
     e1' <- compileExpNonStrict e1
     e2' <- compileReturn e2
-    p <- freshLPat
-    return (mkGRINSequencing e1' p e2')
+    return (mkGRINSequencing e1' (varToLPat x) e2')
 
   LetS x e1 e2 -> do
     e1' <- compileExpStrict e1
@@ -76,8 +123,8 @@ compileReturn = \case
 
   Constructor con [] -> return $
     GRIN.Unit (GRIN.SingleTag (mkConTag con))
-  Constructor con args -> return $
-    GRIN.Unit (GRIN.ConstantTag (mkConTag con) (atomToSimpleVal <$> args))
+  Constructor con args -> withAtomsAsSimpleVals args $ \args' -> return $
+    GRIN.Unit (GRIN.ConstantTag (mkConTag con) args')
 
   Case e cases -> do
     e' <- compileExpStrict e
@@ -89,7 +136,8 @@ compileReturn = \case
         GRIN.Case (GRIN.SimpleVal (GRIN.SimpleVar v)) cases'
 
   e@App{} -> compileExpNonStrict e
-  Atom a -> return $ GRIN.Unit (GRIN.SimpleVal (atomToSimpleVal a))
+  Atom a -> withAtomAsSimpleVal a $ \a' -> return $
+    GRIN.Unit (GRIN.SimpleVal a')
 
 compileCaseExp :: CaseExp -> CodeGen GRIN.CaseExp
 compileCaseExp (CaseExp pat e) = do
@@ -104,13 +152,25 @@ compilePattern (LitPat lit) = return $ GRIN.ConstLiteral (compileLiteral lit)
 
 compileExpStrict :: Exp -> CodeGen GRIN.Exp
 compileExpStrict = \case
-  Atom x@AtomVar{} -> return $
-    GRIN.App (coerce "eval") [atomToSimpleVal x]
+  Atom a@(AtomVar x) -> do
+    fs <- knownFunctions
+    case lookup x fs of
+      Nothing -> return $ GRIN.App (coerce "eval") [atomToSimpleVal a]
+      Just _  -> compileExpStrict (App x [])
   App f args -> do
     fs <- knownFunctions
-    if f `elem` fs
-       then return $ GRIN.App (coerce f) (atomToSimpleVal <$> args)
-       else error ("unknown function: " <> show f) -- need to apply HOF techniques
+    case lookup f fs of
+      Nothing -> do
+        v <- freshVar
+        let vpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar v))
+        return $ mkGRINSequencing (GRIN.App (coerce "eval") [atomToSimpleVal (AtomVar f)]) vpat $
+          GRIN.App (coerce ("apply_" <> show (length args))) (GRIN.SimpleVar v : map atomToSimpleVal args)
+      Just n
+        | n == length args -> return $
+            GRIN.App (coerce f) (atomToSimpleVal <$> args)
+        | otherwise -> return $
+            GRIN.Unit (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) (atomToSimpleVal <$> args))
+
   e@Case{} -> compileReturn e
   e@Let{} -> compileReturn e
   e@LetS{} -> compileReturn e
@@ -129,7 +189,7 @@ compileProgram (Program bindings) = GRIN.Program bindings'
       & runCodeGen
       & flip runReaderT topLevelVars
       & flip evalState defaultFreshVars
-    topLevelVars = map (\(Binding f _args _body) -> f) bindings
+    topLevelVars = map (\(Binding f args _body) -> (f, length args)) bindings
     defaultFreshVars = coerce [ "t" <> show n | n <- [1..] ]
 
 -- compileProgram :: Program -> GRIN.Program

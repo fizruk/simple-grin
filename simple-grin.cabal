@@ -47,12 +47,6 @@ library
       Syntax.Lambda.Par
       Syntax.Lambda.Print
       Syntax.Lambda.Skel
-      Syntax.LambdaNameless.Abs
-      Syntax.LambdaNameless.ErrM
-      Syntax.LambdaNameless.Lex
-      Syntax.LambdaNameless.Par
-      Syntax.LambdaNameless.Print
-      Syntax.LambdaNameless.Skel
   other-modules:
       Paths_simple_grin
   hs-source-dirs:
