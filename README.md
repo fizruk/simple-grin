@@ -92,3 +92,22 @@ apply_1 t16 =
 ## How to build
 
 This project is built using Stack and tested with GHC 9.0.2.
+
+Parsers, abstract syntax trees, and pretty-printers for the three languages are generated using the BNF converter tool. To install BNF converter tool, follow instructions on their [official website](http://bnfc.digitalgrammars.com). For example, you can use the Stack tool:
+
+```sh
+stack install BNFC
+```
+
+To use BNF converter, you will also need to install Alex and Happy (lexer and parser generator tools for Haskell, analogous to YACC and Bison). Using Stack you can install them as follows:
+
+```sh
+stack install alex happy
+```
+
+After making changes to the Labelled BNF for any of the languages in a corresponding `src/Syntax/*.cf` file, make sure to regenerate the code by running `make`:
+
+```sh
+cd src/
+make
+```
