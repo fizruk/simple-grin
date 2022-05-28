@@ -1,0 +1,36 @@
+comment "--" ;
+comment "{-" "-}" ;
+
+token Con (upper (letter | digit | '_')*) ;
+token Var (lower (letter | digit | '_')*) ;
+separator Var "" ;
+
+Program.  Program ::= [Binding] ;
+
+Binding.  Binding ::= Var [Var] "=" Exp ;
+separator Binding ";" ;
+
+Case.         Exp ::= "case" Exp1 "of" "{" [CaseExp] "}" ;
+Let.          Exp ::= "let"  Var "=" Exp1 "in" Exp ;
+LetS.         Exp ::= "letS" Var "=" Exp1 "in" Exp ;
+
+Constructor.  Exp1 ::= Con [Atom] ;
+App.          Exp1 ::= Var [Atom] ;
+
+Atom.         Exp2 ::= Atom ;
+
+_. Exp  ::= Exp1 ;
+_. Exp1 ::= Exp2 ;
+_. Exp2 ::= "(" Exp ")" ;
+
+CaseExp.      CaseExp ::= Pat "->" Exp ;
+separator CaseExp ";" ;
+
+AtomVar.      Atom ::= Var ;
+AtomLiteral.  Atom ::= Literal ;
+separator Atom "" ;
+
+LitInteger.   Literal ::= Integer ;
+
+ConPat. Pat ::= Con [Var] ;
+LitPat. Pat ::= Literal ;

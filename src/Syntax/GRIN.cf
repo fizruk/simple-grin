@@ -1,0 +1,48 @@
+token Tag (upper (letter | digit | '_')*) ;
+token Var (lower (letter | digit | '_')*) ;
+
+Program.  Program ::= [Binding] ;
+
+Binding.  Binding ::= Var [Var] "=" "{" Exp "}" ;
+separator Binding ";" ;
+
+separator Var "" ;
+
+Sequencing. Exp ::= Exp1 "$" "λ" LPat "→ ;" Exp ;
+Case.       Exp ::= "case" Val "of" "{" [CaseExp] "}" ;
+
+CaseExp.    CaseExp ::= CPat "→" "{" Exp "}" ;
+separator CaseExp ";" ;
+
+layout "→" ;
+layout "=" ;
+layout toplevel ;
+
+App.        Exp1 ::= Var [SimpleVal] ;
+Unit.       Exp1 ::= "unit" Val ;
+Store.      Exp1 ::= "store" Val ;
+Fetch.      Exp1 ::= "fetch" Var ;
+Update.     Exp1 ::= "update" Var Val ;
+
+_.  Exp ::= Exp1 ;
+_.  Exp1 ::= "(" Exp ")" ;
+
+SimpleLiteral.    SimpleVal  ::= Literal ;
+SimpleVar.        SimpleVal  ::= Var ;
+separator SimpleVal "" ;
+
+ConstantTag.  Val ::= "(" Tag [SimpleVal] ")" ;
+VariableTag.  Val ::= "(" Var [SimpleVal] ")" ;
+SingleTag.    Val ::= Tag ;
+Empty.        Val ::= "()" ;
+SimpleVal.    Val ::= SimpleVal ;
+
+LPat.         LPat ::= Val ;
+
+ConstNodePattern. CPat ::= "(" Tag [Var] ")" ;
+ConstTagPattern.  CPat ::= Tag ;
+ConstLiteral.     CPat ::= Literal ;
+
+LitInteger.     Literal ::= Integer ;
+LitBoolFalse.   Literal ::= "False" ;
+LitBoolTrue.    Literal ::= "True" ;
