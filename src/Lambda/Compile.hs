@@ -135,7 +135,8 @@ compileReturn = \case
       mkGRINSequencing e' vpat $
         GRIN.Case (GRIN.SimpleVal (GRIN.SimpleVar v)) cases'
 
-  e@App{} -> compileExpNonStrict e
+  e@App{} -> compileExpStrict e
+
   Atom a -> withAtomAsSimpleVal a $ \a' -> return $
     GRIN.Unit (GRIN.SimpleVal a')
 
@@ -166,10 +167,10 @@ compileExpStrict = \case
         return $ mkGRINSequencing (GRIN.App (coerce "eval") [atomToSimpleVal (AtomVar f)]) vpat $
           GRIN.App (coerce ("apply_" <> show (length args))) (GRIN.SimpleVar v : map atomToSimpleVal args)
       Just n
-        | n == length args -> return $
-            GRIN.App (coerce f) (atomToSimpleVal <$> args)
-        | otherwise -> return $
-            GRIN.Unit (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) (atomToSimpleVal <$> args))
+        | n == length args -> withAtomsAsSimpleVals args $ \args' -> return $
+            GRIN.App (coerce f) args'
+        | otherwise -> withAtomsAsSimpleVals args $ \args' -> return $
+            GRIN.Unit (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) args')
 
   e@Case{} -> compileReturn e
   e@Let{} -> compileReturn e
