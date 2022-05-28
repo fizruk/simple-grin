@@ -1,22 +1,54 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE RecordWildCards            #-}
 module Lambda.Compile where
 
-import           Control.Monad.Reader
-import           Control.Monad.State
-import           Data.Coerce          (coerce)
-import           Data.Function        ((&))
-import qualified Syntax.GRIN.Abs      as GRIN
+import           Control.Monad.RWS
+import           Data.Coerce       (coerce)
+import           Data.Function     ((&))
+import           Data.List         (union)
+import qualified Syntax.GRIN.Abs   as GRIN
 import           Syntax.Lambda.Abs
 
-import qualified Syntax.GRIN.Print    as GRIN
-import qualified Syntax.Lambda.Par    as Lambda
+import qualified Syntax.GRIN.Print as GRIN
+import qualified Syntax.Lambda.Par as Lambda
 
-newtype CodeGen a = CodeGen { runCodeGen :: ReaderT [(Var, Int)] (State [GRIN.Var]) a }
+newtype TopLevelSymbols = TopLevelSymbols
+  { getTopLevelSymbols :: [(Var, Int)] }
+  deriving (Show)
+
+data FunctionSymbols = FunctionSymbols
+  { usedFunctionTags :: [(GRIN.Tag, GRIN.Var, Int)]
+  , usedPartialTags  :: [(GRIN.Tag, GRIN.Var, Int, Int)]
+  , usedConTags      :: [(GRIN.Tag, Int)]
+  , usedMaxApply     :: Int
+  } deriving (Show)
+
+instance Semigroup FunctionSymbols where
+  FunctionSymbols fs1 ps1 cs1 m1 <> FunctionSymbols fs2 ps2 cs2 m2
+    = FunctionSymbols (fs1 `union` fs2) (ps1 `union` ps2) (cs1 `union` cs2) (max m1 m2)
+
+instance Monoid FunctionSymbols where
+  mempty = FunctionSymbols mempty mempty mempty 0
+
+newtype CodeGen a = CodeGen
+  { runCodeGen :: RWS TopLevelSymbols FunctionSymbols [GRIN.Var] a }
   deriving (Functor, Applicative, Monad)
 
 knownFunctions :: CodeGen [(Var, Int)]
-knownFunctions = CodeGen ask
+knownFunctions = CodeGen (asks getTopLevelSymbols)
+
+registerApplyFunctionTag :: (GRIN.Tag, GRIN.Var, Int) -> CodeGen ()
+registerApplyFunctionTag t@(_, _, n) = CodeGen (tell (FunctionSymbols [t] [] [] n))
+
+registerFunctionTag :: (GRIN.Tag, GRIN.Var, Int) -> CodeGen ()
+registerFunctionTag f = CodeGen (tell (FunctionSymbols [f] [] [] 0))
+
+registerPartialTag :: (GRIN.Tag, GRIN.Var, Int, Int) -> CodeGen ()
+registerPartialTag f = CodeGen (tell (FunctionSymbols [] [f] [] 0))
+
+registerConTag :: (GRIN.Tag, Int) -> CodeGen ()
+registerConTag f = CodeGen (tell (FunctionSymbols [] [] [f] 0))
 
 freshVar :: CodeGen GRIN.Var
 freshVar = CodeGen $ do
@@ -35,6 +67,45 @@ varToLPat = GRIN.LPat . GRIN.SimpleVal . GRIN.SimpleVar . coerce
 
 mkFunTag :: Var -> GRIN.Tag
 mkFunTag = coerce . ("F" <>) . coerce
+
+applyVar :: Int -> GRIN.Var
+applyVar n = coerce ("apply_" <> show n)
+
+compileApplyFunTag :: Int -> CodeGen GRIN.Tag
+compileApplyFunTag n = do
+  let f = coerce ("apply_" <> show n)
+      tag = mkFunTag f
+  registerApplyFunctionTag (tag, coerce f, n)
+  forM_ [1..n-1] $ \k -> do
+    let g = coerce ("apply_" <> show k)
+        tag' = mkFunTag g
+    registerApplyFunctionTag (tag', coerce g, k)
+  return tag
+
+compileFunTag :: Var -> CodeGen GRIN.Tag
+compileFunTag f = do
+  let tag = mkFunTag f
+  fs <- knownFunctions
+  case lookup f fs of
+    Just n -> do
+      registerFunctionTag (tag, coerce f, n)
+      return tag
+    Nothing -> return tag
+
+compilePartialTag :: Var -> Int -> Int -> CodeGen GRIN.Tag
+compilePartialTag f argsNum leftover = do
+  let tag = mkPartialFunTag f leftover
+  registerPartialTag (tag, coerce f, argsNum, leftover)
+  forM_ [1..leftover - 1] $ \i -> do
+    let tag' = mkPartialFunTag f i
+    registerPartialTag (tag', coerce f, argsNum + leftover - i, i)
+  return tag
+
+compileConTag :: Con -> Int -> CodeGen GRIN.Tag
+compileConTag con n = do
+  let tag = mkConTag con
+  registerConTag (tag, n)
+  return tag
 
 mkPartialFunTag :: Var -> Int -> GRIN.Tag
 mkPartialFunTag f leftover = coerce ("P" <> coerce f <> "_" <> show leftover)
@@ -98,13 +169,15 @@ compileExpNonStrict = \case
     case lookup f fs of
       Nothing -> withAtomsAsSimpleVals args $ \args' -> do
         let n = 1 + length args
-            ap' = mkFunTag (coerce ("apply_" <> show n))
+        ap' <- compileApplyFunTag n
         return $ GRIN.Store (GRIN.ConstantTag ap' (GRIN.SimpleVar (coerce f) : args'))
       Just n
-        | n == length args -> withAtomsAsSimpleVals args $ \args' -> return $
-            GRIN.Store (GRIN.ConstantTag (mkFunTag f) args')
-        | otherwise -> withAtomsAsSimpleVals args $ \args' -> return $
-            GRIN.Store (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) args')
+        | n == length args -> withAtomsAsSimpleVals args $ \args' -> do
+            f' <- compileFunTag f
+            return $ GRIN.Store (GRIN.ConstantTag f' args')
+        | otherwise -> withAtomsAsSimpleVals args $ \args' -> do
+            f' <- compilePartialTag f (length args) (n - length args)
+            return $ GRIN.Store (GRIN.ConstantTag f' args')
   e -> compileReturn e
 
 compileReturn :: Exp -> CodeGen GRIN.Exp
@@ -119,10 +192,12 @@ compileReturn = \case
     e2' <- compileReturn e2
     return (mkGRINSequencing e1' (varToLPat x) e2')
 
-  Constructor con [] -> return $
-    GRIN.Unit (GRIN.SingleTag (mkConTag con))
-  Constructor con args -> withAtomsAsSimpleVals args $ \args' -> return $
-    GRIN.Unit (GRIN.ConstantTag (mkConTag con) args')
+  Constructor con [] -> do
+    con' <- compileConTag con 0
+    return $ GRIN.Unit (GRIN.SingleTag con')
+  Constructor con args -> withAtomsAsSimpleVals args $ \args' -> do
+    con' <- compileConTag con (length args)
+    return $ GRIN.Unit (GRIN.ConstantTag con' args')
 
   Case e cases -> do
     e' <- compileExpStrict e
@@ -145,8 +220,12 @@ compileCaseExp (CaseExp pat e) = do
   return $ GRIN.CaseExp pat' e'
 
 compilePattern :: Pat -> CodeGen GRIN.CPat
-compilePattern (ConPat con []) = return $ GRIN.ConstTagPattern (mkConTag con)
-compilePattern (ConPat con args) = return $ GRIN.ConstNodePattern (mkConTag con) (coerce args)
+compilePattern (ConPat con []) = do
+  con' <- compileConTag con 0
+  return $ GRIN.ConstTagPattern con'
+compilePattern (ConPat con args) = do
+  con' <- compileConTag con (length args)
+  return $ GRIN.ConstNodePattern con' (coerce args)
 compilePattern (LitPat lit) = return $ GRIN.ConstLiteral (compileLiteral lit)
 
 compileExpStrict :: Exp -> CodeGen GRIN.Exp
@@ -167,8 +246,9 @@ compileExpStrict = \case
       Just n
         | n == length args -> withAtomsAsSimpleVals args $ \args' -> return $
             GRIN.App (coerce f) args'
-        | otherwise -> withAtomsAsSimpleVals args $ \args' -> return $
-            GRIN.Unit (GRIN.ConstantTag (mkPartialFunTag f (n - length args)) args')
+        | otherwise -> withAtomsAsSimpleVals args $ \args' -> do
+            f' <- compilePartialTag f (length args) (n - length args)
+            return $ GRIN.Unit (GRIN.ConstantTag f' args')
 
   e@Case{} -> compileReturn e
   e@Let{} -> compileReturn e
@@ -181,13 +261,87 @@ compileBinding (Binding f args body) =
   GRIN.Binding (coerce f) (coerce <$> args) <$>
     compileReturn body
 
+generateApplyN :: FunctionSymbols -> Int -> CodeGen GRIN.Binding
+generateApplyN FunctionSymbols{..} n = do
+  f <- GRIN.SimpleVal . GRIN.SimpleVar <$> freshVar
+  xs <- replicateM n freshVar
+  cases <- mapM (generateApplyNCase n xs) usedPartialTags
+  return $ GRIN.Binding (applyVar n) xs $
+    GRIN.Case f cases
+
+generateApplyNCase
+  :: Int
+  -> [GRIN.Var]
+  -> (GRIN.Tag, GRIN.Var, Int, Int)
+  -> CodeGen GRIN.CaseExp
+generateApplyNCase n args (tag, f, argsNum, leftover) = do
+  xs <- replicateM argsNum freshVar
+  v <- GRIN.SimpleVar <$> freshVar
+  let vpat = GRIN.LPat (GRIN.SimpleVal v)
+  let ap' = applyVar (n - leftover)
+  return $ GRIN.CaseExp (GRIN.ConstNodePattern tag xs) $
+    case splitAt leftover args of
+      _ | n == leftover -> GRIN.App f (map GRIN.SimpleVar (xs <> args))
+      _ | n < leftover -> GRIN.Unit (GRIN.ConstantTag (mkPartialFunTag (coerce f) (leftover - n)) (map GRIN.SimpleVar (xs <> args)))
+      (before, after) ->
+          mkGRINSequencing (GRIN.App f (GRIN.SimpleVar <$> (xs <> before))) vpat $
+            GRIN.App ap' (v : map GRIN.SimpleVar after)
+
+generateEvalConCases :: GRIN.Exp -> FunctionSymbols -> CodeGen [GRIN.CaseExp]
+generateEvalConCases rhs FunctionSymbols{..}
+  = mapM (generateEvalConCase rhs) usedConTags
+
+generateEvalConCase :: GRIN.Exp -> (GRIN.Tag, Int) -> CodeGen GRIN.CaseExp
+generateEvalConCase rhs (con, n) = do
+  xs <- replicateM n freshVar
+  return $ case xs of
+    [] -> GRIN.CaseExp (GRIN.ConstTagPattern con) rhs
+    _  -> GRIN.CaseExp (GRIN.ConstNodePattern con xs) rhs
+
+generateEvalFunCases :: GRIN.Var -> FunctionSymbols -> CodeGen [GRIN.CaseExp]
+generateEvalFunCases p FunctionSymbols{..}
+  = mapM (generateEvalFunCase p) usedFunctionTags
+
+generateEvalFunCase :: GRIN.Var -> (GRIN.Tag, GRIN.Var, Int) -> CodeGen GRIN.CaseExp
+generateEvalFunCase p (tag, f, n) = do
+  xs <- replicateM n freshVar
+  w <- freshVar
+  let wval = GRIN.SimpleVal (GRIN.SimpleVar w)
+  let wpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar w))
+  return $
+    GRIN.CaseExp (GRIN.ConstNodePattern tag xs) $
+      mkGRINSequencing (GRIN.App f (GRIN.SimpleVar <$> xs)) wpat $
+        mkGRINSequencing (GRIN.Update p wval) (GRIN.LPat GRIN.Empty) $
+          GRIN.Unit wval
+
+generateEval :: FunctionSymbols -> CodeGen GRIN.Binding
+generateEval fs = do
+  p <- freshVar
+  v <- GRIN.SimpleVal . GRIN.SimpleVar <$> freshVar
+  let vpat = GRIN.LPat v
+  conCases <- generateEvalConCases (GRIN.Unit v) fs
+  funCases <- generateEvalFunCases p fs
+  return $
+    GRIN.Binding (coerce "eval") [p] $
+      mkGRINSequencing (GRIN.Fetch p) vpat $
+        GRIN.Case v (conCases <> funCases)
+
+generateEvalAndApplyBindings :: FunctionSymbols -> CodeGen [GRIN.Binding]
+generateEvalAndApplyBindings fs@FunctionSymbols{..} = do
+  evalBinding <- generateEval fs
+  applyBindings <- mapM (generateApplyN fs) [1..usedMaxApply]
+  return (evalBinding : applyBindings)
+
 compileProgram :: Program -> GRIN.Program
-compileProgram (Program bindings) = GRIN.Program bindings'
+compileProgram (Program bindings)
+  = GRIN.Program (bindings' ++ helperBindings)
   where
-    bindings' = mapM compileBinding bindings
+    (helperBindings, _) = generateEvalAndApplyBindings symbols
       & runCodeGen
-      & flip runReaderT topLevelVars
-      & flip evalState defaultFreshVars
+      & \m -> evalRWS m (TopLevelSymbols topLevelVars) leftoverVars
+    (bindings', leftoverVars, symbols) = mapM compileBinding bindings
+      & runCodeGen
+      & \m -> runRWS m (TopLevelSymbols topLevelVars) defaultFreshVars
     topLevelVars = map (\(Binding f args _body) -> (f, length args)) bindings
     defaultFreshVars = coerce [ "t" <> show n | n <- [1..] ]
 
