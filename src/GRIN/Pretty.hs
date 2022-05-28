@@ -7,5 +7,5 @@ ppGRIN :: Program -> String
 ppGRIN = clean . GRIN.printTree
   where
     clean
-      = filter (`notElem` "{};")
-      . map (\c -> if c == '$' then ';' else c)
+      = map (\c -> if c == '$' then ';' else c)
+      . filter (`notElem` "{};")
