@@ -96,12 +96,10 @@ compileExpNonStrict = \case
   App f args -> do
     fs <- knownFunctions
     case lookup f fs of
-      Nothing -> do
-        v <- freshVar
-        let vpat = GRIN.LPat (GRIN.SimpleVal (GRIN.SimpleVar v))
-        withAtomsAsSimpleVals args $ \args' -> return $
-          mkGRINSequencing (GRIN.App (coerce "eval") [atomToSimpleVal (AtomVar f)]) vpat $
-            GRIN.App (coerce ("apply_" <> show (length args))) (GRIN.SimpleVar v : args')
+      Nothing -> withAtomsAsSimpleVals args $ \args' -> do
+        let n = 1 + length args
+            ap' = mkFunTag (coerce ("apply_" <> show n))
+        return $ GRIN.Store (GRIN.ConstantTag ap' (GRIN.SimpleVar (coerce f) : args'))
       Just n
         | n == length args -> withAtomsAsSimpleVals args $ \args' -> return $
             GRIN.Store (GRIN.ConstantTag (mkFunTag f) args')
@@ -111,7 +109,7 @@ compileExpNonStrict = \case
 
 compileReturn :: Exp -> CodeGen GRIN.Exp
 compileReturn = \case
-  Let x e1 e2 -> do -- FIXME: do not ignore x
+  Let x e1 e2 -> do
     e1' <- compileExpNonStrict e1
     e2' <- compileReturn e2
     return (mkGRINSequencing e1' (varToLPat x) e2')
